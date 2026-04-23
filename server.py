@@ -14,7 +14,7 @@ import uuid
 from typing import AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 OLLAMA_BASE = "http://127.0.0.1:11434"
@@ -29,15 +29,6 @@ def _ollama_headers() -> dict:
     if API_KEY:
         h["Authorization"] = f"Bearer {API_KEY}"
     return h
-
-
-async def _auth(request: Request) -> None:
-    if not API_KEY:
-        return
-    auth = request.headers.get("Authorization", "")
-    key = request.headers.get("x-api-key", "")
-    if auth != f"Bearer {API_KEY}" and key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 # ── /v1/messages — Anthropic Messages API (Claude Code) ──────────────────────
@@ -83,7 +74,6 @@ async def _anthropic_sse(payload: dict, msg_id: str) -> AsyncGenerator[str, None
 
 @app.post("/v1/messages")
 async def messages(request: Request):
-    await _auth(request)
     body = await request.json()
 
     system = body.get("system", "")
@@ -176,7 +166,6 @@ async def _openai_sse(payload: dict) -> AsyncGenerator[str, None]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    await _auth(request)
     body = await request.json()
 
     payload = {
@@ -223,7 +212,6 @@ async def chat_completions(request: Request):
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "DELETE"])
 async def ollama_passthrough(path: str, request: Request):
-    await _auth(request)
     body = await request.body()
     async with httpx.AsyncClient(timeout=600) as client:
         resp = await client.request(
