@@ -17,7 +17,9 @@ ollama serve &
 
 # ── Wait for Ollama HTTP API ──────────────────────────────────────────────────
 MAX_WAIT=120; ELAPSED=0
-until curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
+until curl -sf \
+    ${OLLAMA_API_KEY:+-H "Authorization: Bearer ${OLLAMA_API_KEY}"} \
+    http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
     (( ELAPSED >= MAX_WAIT )) && { echo "[start] ERROR: Ollama timeout" >&2; exit 1; }
     sleep 2; (( ELAPSED += 2 ))
 done
