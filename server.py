@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 OLLAMA_BASE = "http://127.0.0.1:11434"
-MODEL = os.environ.get("MODEL_NAME", "qwen3:32b")
+MODEL = os.environ.get("MODEL_NAME", "gemma4:e2b")
 API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 
 app = FastAPI(title="Ollama Gateway")
