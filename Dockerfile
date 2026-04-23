@@ -18,7 +18,7 @@ RUN pip3 install --no-cache-dir --break-system-packages fastapi "uvicorn[standar
 
 # ── Ollama runtime configuration ─────────────────────────────────────────────
 # Model served
-ENV MODEL_NAME=qwen3:27b
+ENV MODEL_NAME=qwen3:32b
 
 # Bind on all interfaces so FastAPI can reach Ollama
 ENV OLLAMA_HOST=0.0.0.0:11434

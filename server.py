@@ -15,7 +15,7 @@ from typing import AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 OLLAMA_BASE = "http://127.0.0.1:11434"
 MODEL = os.environ.get("MODEL_NAME", "qwen3:27b")
@@ -111,7 +111,9 @@ async def messages(request: Request):
         resp = await client.post(
             f"{OLLAMA_BASE}/api/chat", headers=_ollama_headers(), json=payload,
         )
-        resp.raise_for_status()
+    if resp.status_code != 200:
+        return Response(content=resp.content, status_code=resp.status_code,
+                        media_type="application/json")
     result = resp.json()
 
     msg = result.get("message", {})
@@ -191,7 +193,9 @@ async def chat_completions(request: Request):
         resp = await client.post(
             f"{OLLAMA_BASE}/api/chat", headers=_ollama_headers(), json=payload,
         )
-        resp.raise_for_status()
+    if resp.status_code != 200:
+        return Response(content=resp.content, status_code=resp.status_code,
+                        media_type="application/json")
     result = resp.json()
 
     return {
