@@ -26,13 +26,16 @@ until curl -sf --max-time 5 \
 done
 echo "[start] Ollama ready (${ELAPSED}s)."
 
-# ── Remove any cached models that don't match MODEL ──────────────────────────
+# ── Remove stale models and partial downloads ─────────────────────────────────
 ollama list 2>/dev/null | tail -n +2 | awk '{print $1}' | while read -r cached; do
     if [ -n "$cached" ] && [ "$cached" != "$MODEL" ]; then
         echo "[start] Removing stale model: ${cached}"
         ollama rm "$cached" 2>/dev/null || true
     fi
 done
+# Remove incomplete blob files left by failed pulls (they end in -partial)
+find "${OLLAMA_MODELS}/blobs" -name "*-partial" -delete 2>/dev/null && \
+    echo "[start] Cleaned partial downloads." || true
 
 # ── Pull model if not cached ──────────────────────────────────────────────────
 if ollama list 2>/dev/null | grep -qF "${MODEL}"; then
