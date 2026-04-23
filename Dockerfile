@@ -19,9 +19,6 @@ RUN pip3 install --no-cache-dir --break-system-packages fastapi "uvicorn[standar
 # Model served
 ENV MODEL_NAME=qwen3:27b
 
-# API key auth — Ollama requires this header: Authorization: Bearer <key>
-ENV OLLAMA_API_KEY=ZVik03SluuDv0Ynh3wIOIQ==
-
 # Bind on all interfaces so FastAPI can reach Ollama
 ENV OLLAMA_HOST=0.0.0.0:11434
 
