@@ -237,6 +237,11 @@ async def ollama_passthrough(path: str, request: Request):
 
 # ── /health ───────────────────────────────────────────────────────────────────
 
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
+
+
 @app.get("/health")
 async def health():
     try:
