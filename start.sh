@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL="${MODEL_NAME:-gemma4:e2b}"
+MODEL="${MODEL_NAME:-qwen3.6:27b}"
 PORT="${PORT:-80}"
 
 # ── Network volume: prefer persistent storage when RunPod mounts one ─────────
