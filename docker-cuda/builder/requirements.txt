@@ -1,14 +1,3 @@
-ray
-pandas
-pyarrow
-runpod
-huggingface-hub
-packaging
-typing-extensions>=4.8.0
-pydantic
-pydantic-settings
-hf-transfer
-transformers>=4.57.0
-bitsandbytes>=0.45.0
-kernels
-torch-c-dlpack-ext
+runpod>=1.7.0
+httpx>=0.27.0
+hf-transfer>=0.1.8
