@@ -1,296 +1,446 @@
 # RunPod — Qwen3.6-27B vLLM deployments
 
+## Pick up here next session
+
+**Endpoint and volume were torn down at pause time.** What survived is zero-cost
+to keep and reusable:
+
+| Resource | ID | Status |
+|---|---|---|
+| Template | `7rr31v1f4o` | still on RunPod, ready to attach to a new endpoint |
+| Registry auth | `cmoc95oxr0086jv06c3t9n2es` (`ghcr-ediksimonian`) | attached to template |
+| RunPod secret | `HF_TOKEN` (console-only) | template references it |
+| CUDA image | `ghcr.io/ediksimonian/runpod-cuda:main` (sha-bc34eda, public) | ready to pull |
+| ROCm image | `ghcr.io/ediksimonian/runpod-rocm:main` (public) | ready to pull |
+
+**Resume steps** (~5 min of CLI + a cold-boot wait):
+
+1. **Commit the local split-Dockerfile change first** so the next build picks
+   up the layer-splitting optimization:
+   ```bash
+   git diff docker-cuda/Dockerfile    # review
+   git add docker-cuda/Dockerfile CLAUDE.md
+   git commit -m "Split CUDA Dockerfile into torch/flashinfer/vllm layers"
+   git push origin main
+   # Wait ~15 min for GHA to rebuild and push a new :main image
+   ```
+
+2. **Recreate volume + endpoint** (template already exists and is wired up):
+   ```bash
+   SUFFIX=$(date +%H%M%S)
+   VOL=$(runpodctl network-volume create \
+     --name "qwen3-models-eu-se-$SUFFIX" --size 30 \
+     --data-center-id EU-SE-1 | jq -r .id)
+   EP=$(runpodctl serverless create \
+     --name "qwen3.6-27b-vllm-a6000-$SUFFIX" \
+     --template-id 7rr31v1f4o \
+     --network-volume-id "$VOL" \
+     --data-center-ids EU-SE-1 \
+     --gpu-id "NVIDIA RTX A6000" \
+     --gpu-count 1 --workers-min 1 --workers-max 1 | jq -r .id)
+   echo "VOL=$VOL EP=$EP"
+   ```
+
+3. **Watch the cold boot** (expect ~8–12 min if split-Dockerfile change landed,
+   otherwise ~12–15 min):
+   ```bash
+   KEY=$(grep apikey ~/.runpod/config.toml | sed "s/.*= *'\([^']*\).*/\1/")
+   watch -n 20 "curl -sS https://api.runpod.ai/v2/$EP/health -H 'Authorization: Bearer \$KEY' | jq .workers"
+   ```
+
+4. **Verify with canonical tests** (both should PASS now that
+   `LIMIT_MM_PER_PROMPT` JSON format is in the template):
+   ```bash
+   python tests/run_tests.py "$EP"
+   ```
+
+5. **Fire a real `/openai/v1` request** (what LiteLLM + Claude Code will do):
+   ```bash
+   curl -sS https://api.runpod.ai/v2/$EP/openai/v1/chat/completions \
+     -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+     -d '{"model":"cyankiwi/Qwen3.6-27B-AWQ-INT4","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
+   ```
+
+6. **After green**, drop Active-tier billing:
+   ```bash
+   curl -sS -X PATCH "https://rest.runpod.io/v1/endpoints/$EP" \
+     -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+     -d '{"workersMin":0}'
+   ```
+
+7. **Wire up LiteLLM + Claude Code** — recipe at the bottom of this file.
+
+**Uncommitted working-tree changes at session end** (check `git status`):
+- `docker-cuda/Dockerfile` — three-way layer split (torch / flashinfer / vllm)
+  so parallel-pull halves first-boot time. Pins torch 2.10.0, flashinfer 0.6.6
+  per vLLM 0.19.1 `requirements/cuda.txt`.
+- `CLAUDE.md` — this document itself.
+- Also `D server.py D start.sh` — leftover Ollama-era files that were removed
+  from the working tree long ago but not staged. Decide separately.
+
+**Known issues resolved but not yet end-to-end verified:**
+- `log_error_stack` vLLM-0.19 API drift → solved by replacing worker-vllm's
+  Python wrapper with the subprocess HTTP proxy handler.
+- `compressed-tensors` vs `awq` quant mismatch → `QUANTIZATION=compressed-tensors`
+  in template env.
+- `LIMIT_MM_PER_PROMPT` format change from `image=5,video=2` →
+  `{"image":5,"video":2}` → template env now uses JSON.
+
+Expected spend to green-light on resume: ~$0.50–1.00 of Active-tier billing
+during the final cold boot + test run.
+
+**If you want to wipe everything instead of resuming:**
+```bash
+runpodctl template delete 7rr31v1f4o
+runpodctl registry delete cmoc95oxr0086jv06c3t9n2es
+# HF_TOKEN secret: delete in the console at
+# https://www.runpod.io/console/user/secrets
+# GHCR images cost nothing to leave; delete at
+# https://github.com/EdikSimonian?tab=packages if you want
+```
+
+---
+
+
 ## Target model: Qwen3.6-27B (locked)
 
 **The target model for every deployment is `Qwen/Qwen3.6-27B`** (or its quants).
-Do not silently swap to Qwen3-32B or another family — the user has explicitly committed
-to Qwen3.6-27B. If a constraint (GPU, vLLM version, quant availability) makes it
-infeasible, surface the tradeoff; don't substitute.
+Do not silently swap to Qwen3-32B or another family — the user has explicitly
+committed to Qwen3.6-27B. If a constraint (GPU, vLLM version, quant availability)
+makes it infeasible, surface the tradeoff; don't substitute.
 
-Qwen3.6-27B is a **vision-language model** (architecture `Qwen3_5ForConditionalGeneration`,
-`model_type: qwen3_5`). It has no text-only sibling. Implications:
+Qwen3.6-27B is a **vision-language model** (architecture
+`Qwen3_5ForConditionalGeneration`, `model_type: qwen3_5`). Takes text + image +
+video input, outputs **text only** (no image/video generation). Has no text-only
+sibling. Implications:
+
 - Cannot use the stock `runpod/worker-v1-vllm` image — that worker is text-only.
 - Requires **vLLM ≥ 0.17.0** (Qwen3.5 architecture support landed in 0.17.0).
 - Model repo ships no Python modeling files, so `trust_remote_code` doesn't rescue
   older vLLM versions.
 
-## Serving stack
+## Serving stack: HTTP proxy in front of `vllm serve`
 
-Queue-based serverless endpoint running a **custom image** (in `docker/`) that is
-worker-vllm's handler forked from v2.14.0 with the base layers bumped:
+Queue-based serverless endpoint. The container runs a 240-line RunPod handler
+(`src/handler.py`) that:
 
-- `nvidia/cuda:12.8.0-base-ubuntu22.04` (was 12.9.1 — 5090 host drivers reject ≥12.9)
-- `vllm[flashinfer]==0.19.1` with PyTorch cu128 wheels (was 0.16.0 cu129)
-- Everything else in `src/` and `builder/requirements.txt` is a verbatim copy of
-  worker-vllm v2.14.0
+1. Spawns `python -m vllm.entrypoints.openai.api_server` as a subprocess at
+   container start
+2. Waits up to 20 min for `/health` to return 200
+3. Forwards RunPod job inputs to localhost:8000 via HTTP (handles streaming +
+   non-streaming + `/v1/models`)
 
-Endpoint exposes `https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1/*`, consumed by
-Claude Code through an Anthropic↔OpenAI translation proxy (LiteLLM or
-claude-code-router — not yet set up). vLLM's continuous batching handles concurrency
-inside a single worker.
+**Why we don't use worker-vllm's Python-layer wrapper.** worker-vllm v2.14.0
+imports `vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat` and
+friends directly. vLLM 0.17+ restructured that layer (new required
+`openai_serving_render` kwarg, removed `log_error_stack`, split Chat/Render), so
+every public fork that bumped vLLM without touching engine.py (YeDaxia, bgeneto,
+linllm, and upstream itself) crashes on engine init. vLLM's **HTTP** API is
+stable across versions; its Python surface is not. The proxy handler treats vLLM
+as a subprocess with a stable REST contract and survives future upgrades with
+zero code changes.
 
-Auth is the account API key at `~/.runpod/config.toml` (Bearer token). RunPod validates
-at the edge — you can't set a custom LB bearer.
+Endpoint exposes `https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1/*`, consumed
+by Claude Code through an Anthropic↔OpenAI translation proxy (LiteLLM or
+claude-code-router — not yet set up). vLLM's continuous batching handles
+concurrency inside a single worker.
 
-`handler.py` in the repo root is the old Ollama queue handler and is obsolete under the
-vLLM setup.
+Auth is the account API key at `~/.runpod/config.toml` (Bearer token). RunPod
+validates at the edge — you can't set a custom LB bearer.
+
+The handler supports three input shapes (compatible with worker-vllm v2.14.0
+tests_json):
+- `{"input": {"openai_route": "/v1/chat/completions", "openai_input": {...}}}`
+- `{"input": {"openai_route": "/v1/models"}}` (GET)
+- `{"input": {"prompt": "...", "max_tokens": ..., ...}}` (legacy shorthand; wrapped
+  into a single-user-message chat completion)
 
 ## Quantization ladder by GPU
 
 | GPU        | VRAM   | Quant used        | Model variant                       |
 |------------|--------|-------------------|-------------------------------------|
-| RTX 5090   | 32 GB  | **Q4** (AWQ Int4) | `cyankiwi/Qwen3.6-27B-AWQ-INT4`     |
+| RTX A6000  | 48 GB  | **Q4** (compressed-tensors / AWQ Int4) | `cyankiwi/Qwen3.6-27B-AWQ-INT4` |
+| RTX 5090   | 32 GB  | **Q4** (same) — tight | `cyankiwi/Qwen3.6-27B-AWQ-INT4` |
 | H100 80GB  | 80 GB  | **FP8**           | `Qwen/Qwen3.6-27B-FP8`              |
 | MI300X     | 192 GB | **FP16** (BF16)   | `Qwen/Qwen3.6-27B` (native)         |
 
-## Building the images
-
-Two images, two contexts, two workflows — one per GPU platform. Both push to GHCR.
-
-| Platform | Context        | Workflow                              | Resulting image                              |
-|----------|----------------|---------------------------------------|----------------------------------------------|
-| CUDA (5090, H100) | `docker-cuda/` | `.github/workflows/docker-cuda.yml` | `ghcr.io/ediksimonian/runpod-cuda:main`      |
-| ROCm (MI300X)     | `docker-rocm/` | `.github/workflows/docker-rocm.yml` | `ghcr.io/ediksimonian/runpod-rocm:main`      |
-
-Each workflow triggers only on changes to its own context or workflow file, and on
-its own version tags (`cuda-v*` / `rocm-v*`). Also has `workflow_dispatch` for manual
-runs.
-
-Extra image tags produced by each workflow:
-- `:main` — latest main build
-- `:sha-<short-sha>` — pinned to a commit
-- `:<semver>` — when a `cuda-vX.Y.Z` or `rocm-vX.Y.Z` tag is pushed
-
-### CUDA image (docker-cuda/)
-
-- Base: `nvidia/cuda:12.8.0-base-ubuntu22.04` (5090 hosts reject CUDA ≥ 12.9)
-- Pip: `vllm[flashinfer]==0.19.1` + cu128 torch wheels
-- Works on both RTX 5090 (Blackwell) and H100 (Hopper) — same image, different GPU.
-- Compressed size: ~10 GB.
-
-### ROCm image (docker-rocm/)
-
-- Base: `rocm/vllm-dev:preview_releases_v0.20.0_20260422` (AMD-published; vLLM 0.20,
-  ROCm 7.12). This is a *preview* tag; if it rolls off Docker Hub or you need newer
-  vLLM, pick the closest tag from <https://hub.docker.com/r/rocm/vllm-dev/tags>.
-  Reason we can't use `rocm/vllm:latest`: that stable tag is stuck at vLLM 0.16
-  which pre-dates Qwen3.5 support.
-- Just layers worker-vllm's `src/` handler and the runpod SDK on top.
-- Compressed size: ~11 GB.
-
-Weights are NOT baked into either image — they download to the network volume at
-first run, controlled by `MODEL_NAME` on the template.
-
-### First-time package visibility
-
-After each workflow's first successful run, the resulting GHCR package is private.
-For each package at
-`https://github.com/EdikSimonian/runpod/pkgs/container/runpod-cuda` and
-`https://github.com/EdikSimonian/runpod/pkgs/container/runpod-rocm`, either:
-
-- Flip it public (Package → Settings → Change visibility → Public) — RunPod pulls
-  with no auth; or
-- Keep it private and register a GitHub PAT (scope `read:packages`):
-  ```bash
-  runpodctl registry create --name ghcr \
-    --username ediksimonian --password <GITHUB_PAT_WITH_read:packages>
-  ```
-  Then attach that registry auth to each template in the console (no CLI flag yet).
-
-### Baking weights into the image (optional)
-
-If cold-start model download is unacceptable, add build args to a workflow:
-```
---build-arg MODEL_NAME=cyankiwi/Qwen3.6-27B-AWQ-INT4 \
---build-arg BASE_PATH=/models \
---secret id=HF_TOKEN,env=HF_TOKEN
-```
-(Swap `BASE_PATH` to a local path so the download doesn't land in the serverless
-`/runpod-volume` convention.)
-
-### Speed up the HF model download: `HF_HUB_ENABLE_HF_TRANSFER=1`
-
-Both Dockerfiles install `hf-transfer` but default to **`HF_HUB_ENABLE_HF_TRANSFER=0`**
-(carried over from worker-vllm v2.14.0). Flip this to `1` via the template env to
-enable the Rust parallel-chunk downloader — typically **2–3× faster** (100–250 MB/s
-vs 30–60 MB/s) on first cold start where the 20 GB of weights land on the network
-volume.
-
-Current A6000 template (`zd4l51zx12`) already has it set to `1`. Always include
-`HF_HUB_ENABLE_HF_TRANSFER: '1'` in the template env JSON for future deploys —
-this is a pure configuration change, no image rebuild required.
-
-Cold-start expectations with `hf_transfer` on:
-- Image pull (GHCR → RunPod, 8 GB compressed): 3–6 min (bottleneck, not affected)
-- Weights download (HF → volume, 20 GB across 4 shards): 2–3 min (was 5–10)
-- vLLM engine init: 1–2 min
-- Total first-ever cold start: ~8–10 min (was 12–15)
-
-## Current state — RTX A6000 in EU-SE-1 (Q4, Qwen3.6-27B)
-
-```
-endpoint:        vllm-siz44ua4w8iett   (name: qwen3.6-27b-vllm-a6000-<timestamp>)
-template:        zd4l51zx12            (containerRegistryAuthId attached)
-network volume:  nly31qtcez            (30 GB, EU-SE-1)
-registry auth:   cmoc95oxr0086jv06c3t9n2es   (ghcr-ediksimonian)
-image:           ghcr.io/ediksimonian/runpod-cuda:main  (sha-6f8792b)
-model:           cyankiwi/Qwen3.6-27B-AWQ-INT4
-gpu:             NVIDIA RTX A6000      (48 GB)
-workers:         min=0, max=1
-OpenAI base:     https://api.runpod.ai/v2/vllm-siz44ua4w8iett/openai/v1
-pricing:         Flex $1.22/hr active | Active $1.04/hr always-on
-```
-
-Why this combo: **A6000 is the cheapest serverless GPU with real headroom for
-Qwen3.6-27B × 16 users** (48 GB VRAM = 20 GB weights + 24 GB KV cache, room for
-16 users at 16k context). EU-SE-1 is the only DC that has BOTH volume support AND
-current A6000 stock.
-
-**Quantization gotcha for `cyankiwi/Qwen3.6-27B-AWQ-INT4`:** despite the "AWQ" in
-the repo name, this model's `config.json` declares `quantization_config.format:
-pack-quantized` which is the **compressed-tensors** library's packed format, NOT
-classic AWQ. vLLM validates model-config quantization against the `--quantization`
-argument at load time, so passing `QUANTIZATION=awq` fails with:
+**Quant gotcha for `cyankiwi/Qwen3.6-27B-AWQ-INT4`:** despite "AWQ" in the repo
+name, the model's `config.json` declares
+`quantization_config.format: pack-quantized` which is the **compressed-tensors**
+library's packed format, NOT classic AWQ. vLLM validates the model-config quant
+against the `--quantization` argument at load time, so passing
+`QUANTIZATION=awq` fails with:
 ```
 Quantization method specified in the model config (compressed-tensors) does not
 match the quantization method specified in the `quantization` argument (awq)
 ```
-Set **`QUANTIZATION=compressed-tensors`** for this model. Always check
+Set **`QUANTIZATION=compressed-tensors`**. Always read
 `huggingface.co/<repo>/raw/main/config.json → quantization_config.format` before
 picking the vLLM quant arg; the HF repo name can lie.
 
-### Reusable state from earlier attempts
+## Repo layout
 
-- **GHCR registry auth**: id `cmoc95oxr0086jv06c3t9n2es`, name `ghcr-ediksimonian`.
-  Attach to a new template via REST
-  `PATCH /v1/templates/<id> {"containerRegistryAuthId":"cmoc95oxr0086jv06c3t9n2es"}`.
-- **`HF_TOKEN` secret** in the RunPod console, referenced as
-  `{{ RUNPOD_SECRET_HF_TOKEN }}`.
+```
+docker-cuda/            CUDA image context (5090, H100)
+  Dockerfile            nvidia/cuda:12.8.0 + vllm[flashinfer]==0.19.1 + cu128 torch
+  src/handler.py        The 240-line subprocess + HTTP proxy handler
+  builder/requirements.txt  runpod, httpx, hf-transfer (that's it)
 
-### Lessons banked from the last attempts
+docker-rocm/            ROCm image context (MI300X)
+  Dockerfile            rocm/vllm-dev:preview_releases_v0.20.0_20260422
+  src/handler.py        Same handler as docker-cuda
+  builder/requirements.txt  Same trim
 
-- **US-IL-1 5090 stock was Low then empty.** Workers spent ~3 min `initializing`
-  then got pulled back (`throttled=1`) with no container ever starting. Retrying
-  didn't help. `runpod/worker-v1-vllm` had pulled fine there previously because
-  it was already layer-cached on RunPod hosts — our new GHCR image was not.
-- **EUR-IS-2 has High 5090 stock but no volume support.** Error text if you try:
-  `"Data center EUR-IS-2 not found or does not support network volumes"`.
-  Redeployed there without a volume and it successfully began `initializing`, no
-  throttle. Cold start was ~10+ min (image pull + 20 GB model download), never
-  got to verify the final engine-up state because the user torn down.
-- **DCs that support network volumes (remember this list):**
-  `AP-JP-1, CA-MTL-3, CA-MTL-4, EU-CZ-1, EU-NL-1, EU-RO-1, EU-SE-1, EUR-IS-1,
-  EUR-IS-3, EUR-NO-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-MO-1, US-MO-2,
-  US-NC-1, US-NC-2, US-NE-1, US-TX-3, US-WA-1`. If the chosen DC isn't here,
-  volume creation fails.
-- **Template name collisions are permanent-ish.** RunPod soft-deletes templates
-  and the names linger. Always append `-$(date +%H%M%S)` to template + endpoint
-  names on re-create.
-- **5090 capacity is scarce.** Plan for multi-region fallback and/or graduate
-  straight to H100 for anything that isn't a demo.
+.github/workflows/
+  docker-cuda.yml       Builds on docker-cuda/**, pushes ghcr.io/.../runpod-cuda
+  docker-rocm.yml       Builds on docker-rocm/**, pushes ghcr.io/.../runpod-rocm
 
-## Deploy playbook — RTX 5090 in US-IL-1 (Q4, Qwen3.6-27B)
+tests/
+  tests_json            Lifted verbatim from worker-vllm v2.14.0/.runpod/tests_json
+  run_tests.py          Fires both cases at a live endpoint, validates response
+  README.md             How to run
+```
+
+## Building the images (CI on GitHub Actions)
+
+Two images, two contexts, two workflows. Both push to GHCR as public packages.
+
+| Platform       | Context        | Workflow                | Image |
+|----------------|----------------|-------------------------|-------|
+| CUDA (5090 / A6000 / H100) | `docker-cuda/` | `.github/workflows/docker-cuda.yml` | `ghcr.io/ediksimonian/runpod-cuda:main` |
+| ROCm (MI300X)  | `docker-rocm/` | `.github/workflows/docker-rocm.yml` | `ghcr.io/ediksimonian/runpod-rocm:main` |
+
+Each workflow triggers only on changes to its own context or workflow file, on
+its own version tags (`cuda-v*` / `rocm-v*`), and via `workflow_dispatch` for
+manual runs. Caches are scoped per-platform (`cache-from: type=gha,scope=cuda` /
+`scope=rocm`) so they don't collide.
+
+Resulting tags per workflow:
+- `:main` — latest main build
+- `:sha-<short-sha>` — pinned to a commit
+- `:<semver>` — when a `cuda-vX.Y.Z` or `rocm-vX.Y.Z` tag is pushed
+
+First build per workflow pushes the package as **public** (verified). RunPod
+pulls with anonymous auth on public packages; we also have a registered GHCR
+PAT as belt-and-suspenders (see "Reusable state" below).
+
+### CUDA image (docker-cuda/)
+- Base: `nvidia/cuda:12.8.0-base-ubuntu22.04` (5090 hosts reject CUDA ≥ 12.9 —
+  Blackwell drivers top out at 12.8).
+- Pip: `vllm[flashinfer]==0.19.1` + cu128 torch wheels.
+- Runs on 5090 (Blackwell), A6000 (Ampere), H100 (Hopper) — same image, the GPU
+  choice lives on the endpoint.
+- Compressed size: ~8 GB.
+
+### ROCm image (docker-rocm/)
+- Base: `rocm/vllm-dev:preview_releases_v0.20.0_20260422` (AMD-published, vLLM
+  0.20, ROCm 7.12). If this tag ages off, pick the closest newer one from
+  <https://hub.docker.com/r/rocm/vllm-dev/tags>. Don't use `rocm/vllm:latest` —
+  it's stuck at vLLM 0.16 (pre-Qwen3.5).
+- Installs our 3 requirements on top with `--no-deps` so pip doesn't try to
+  re-resolve torch/transformers.
+- Compressed size: ~13 GB.
+
+Weights are **not** baked in — they download to the network volume at first
+run, controlled by `MODEL_NAME` on the template.
+
+### Speed up the HF model download: `HF_HUB_ENABLE_HF_TRANSFER=1`
+Both Dockerfiles set it by default. `hf-transfer` is a Rust parallel-chunk
+downloader that delivers 100–250 MB/s vs 30–60 MB/s from the stock client, so
+the 20 GB AWQ weights download in ~2–3 min instead of 5–10.
+
+### Baking weights into the image (optional, not currently used)
+Add build args to a workflow:
+```
+--build-arg MODEL_NAME=cyankiwi/Qwen3.6-27B-AWQ-INT4
+--build-arg BASE_PATH=/models
+--secret id=HF_TOKEN,env=HF_TOKEN
+```
+Swap `BASE_PATH` to a local path (not `/runpod-volume`) so the download doesn't
+land in the serverless volume convention.
+
+## Tests
+
+`tests/tests_json` — lifted verbatim from worker-vllm v2.14.0 so our handler is
+verified against the exact same input contract the upstream worker promises.
+Two cases:
+- `basic_inference_test` — bare prompt shorthand
+- `openai_messages_test` — full OpenAI chat-completions body with system + user
+  messages
+
+Run against a live endpoint:
+```bash
+python tests/run_tests.py <ENDPOINT_ID>
+```
+Exits 0 on all-pass. API key comes from `RUNPOD_API_KEY` env or
+`~/.runpod/config.toml`.
+
+## Current state
+
+**Endpoint and volume torn down.** Template survived and is pre-configured:
+
+```
+template:        7rr31v1f4o  (qwen3.6-27b-awq-vllm-a6000-221511)
+  image          ghcr.io/ediksimonian/runpod-cuda:main (sha-bc34eda)
+  env            MODEL_NAME=cyankiwi/Qwen3.6-27B-AWQ-INT4
+                 QUANTIZATION=compressed-tensors
+                 MAX_MODEL_LEN=16384
+                 MAX_NUM_SEQS=16
+                 GPU_MEMORY_UTILIZATION=0.92
+                 LIMIT_MM_PER_PROMPT={"image":5,"video":2}  (JSON, vLLM 0.19 req)
+                 ENABLE_AUTO_TOOL_CHOICE=true
+                 TOOL_CALL_PARSER=hermes
+                 TRUST_REMOTE_CODE=true
+                 BASE_PATH=/runpod-volume
+                 HF_HOME=/runpod-volume/huggingface-cache/hub
+                 HF_TOKEN={{ RUNPOD_SECRET_HF_TOKEN }}
+                 HF_HUB_ENABLE_HF_TRANSFER=1
+  container      30 GB
+  volume mount   /runpod-volume
+  registry auth  cmoc95oxr0086jv06c3t9n2es (ghcr-ediksimonian) — attached
+```
+
+Target GPU on resume: **NVIDIA RTX A6000** in **EU-SE-1** (only DC with both
+volume support AND current A6000 stock).
+
+Pricing: Flex $1.22/hr active | Active $1.04/hr always-on. With
+`workers-min=0` post-verification, idle cost is $0.
+
+Template env (full):
+```
+MODEL_NAME                 = cyankiwi/Qwen3.6-27B-AWQ-INT4
+QUANTIZATION               = compressed-tensors  # NOT 'awq' (see quant gotcha)
+MAX_MODEL_LEN              = 16384
+GPU_MEMORY_UTILIZATION     = 0.92
+MAX_NUM_SEQS               = 16
+LIMIT_MM_PER_PROMPT        = {"image":5,"video":2}  # vision + video input enabled
+ENABLE_AUTO_TOOL_CHOICE    = true
+TOOL_CALL_PARSER           = hermes
+TRUST_REMOTE_CODE          = true
+BASE_PATH                  = /runpod-volume
+HF_HOME                    = /runpod-volume/huggingface-cache/hub
+HF_TOKEN                   = {{ RUNPOD_SECRET_HF_TOKEN }}
+HF_HUB_ENABLE_HF_TRANSFER  = 1
+```
+
+Why A6000 in EU-SE-1:
+- A6000 is the cheapest serverless GPU with real headroom for 16 users (48 GB =
+  20 GB weights + 24 GB KV cache = 16 users × 12k context easily).
+- EU-SE-1 is the only DC with both volume support AND current A6000 stock.
+- GPUs with wider availability (H100) cost 3× more per hour at Flex tier.
+
+## Reusable state (persists across re-deploys)
+
+- **GHCR registry auth**: id `cmoc95oxr0086jv06c3t9n2es`, name
+  `ghcr-ediksimonian`. Created with:
+  ```bash
+  runpodctl registry create --name ghcr-ediksimonian \
+    --username ediksimonian --password $(gh auth token)
+  ```
+  Attach to a new template via REST (no CLI flag yet):
+  ```bash
+  curl -sS -X PATCH "https://rest.runpod.io/v1/templates/<TPL>" \
+    -H "Authorization: Bearer $RUNPOD_API_KEY" -H "Content-Type: application/json" \
+    -d '{"containerRegistryAuthId":"cmoc95oxr0086jv06c3t9n2es"}'
+  ```
+- **`HF_TOKEN` RunPod secret** — created in the console at
+  <https://www.runpod.io/console/user/secrets>. Templates reference it as
+  `{{ RUNPOD_SECRET_HF_TOKEN }}`. Required because anon HF pulls are rate-limited
+  (you'll see `Warning: You are sending unauthenticated requests to the HF Hub`
+  in worker logs if the secret isn't resolved).
+- **Published GHCR images** (public): `ghcr.io/ediksimonian/runpod-cuda:main`,
+  `ghcr.io/ediksimonian/runpod-rocm:main`, each tagged also with `:sha-<short>`.
+  They persist forever on GHCR; no re-cost to re-pull.
+
+## Deploy playbook — from zero (A6000 in EU-SE-1)
 
 ```bash
-IMAGE="ghcr.io/ediksimonian/runpod-cuda:main"   # built + pushed from ./docker
+set -e
+SUFFIX=$(date +%H%M%S)
+KEY=$(grep apikey ~/.runpod/config.toml | sed "s/.*= *'\([^']*\).*/\1/")
+GHCR_AUTH=cmoc95oxr0086jv06c3t9n2es
 
-# 1. Network volume (30 GB fits one AWQ Int4 quant ~20 GB)
-runpodctl network-volume create \
-  --name qwen3-models-us-il --size 30 --data-center-id US-IL-1
-# -> note volume id
+# 1. Volume (30 GB fits one AWQ Int4 ~20 GB + overhead)
+VOL=$(runpodctl network-volume create \
+  --name "qwen3-models-eu-se-$SUFFIX" --size 30 --data-center-id EU-SE-1 \
+  | jq -r .id)
 
 # 2. Template
 ENV_JSON=$(python3 -c "import json; print(json.dumps({
   'MODEL_NAME': 'cyankiwi/Qwen3.6-27B-AWQ-INT4',
-  'QUANTIZATION': 'awq',
-  'MAX_MODEL_LEN': '8192',
+  'QUANTIZATION': 'compressed-tensors',
+  'MAX_MODEL_LEN': '16384',
   'GPU_MEMORY_UTILIZATION': '0.92',
   'MAX_NUM_SEQS': '16',
+  'LIMIT_MM_PER_PROMPT': '{"image":5,"video":2}',
   'ENABLE_AUTO_TOOL_CHOICE': 'true',
   'TOOL_CALL_PARSER': 'hermes',
   'TRUST_REMOTE_CODE': 'true',
   'BASE_PATH': '/runpod-volume',
   'HF_HOME': '/runpod-volume/huggingface-cache/hub',
-  'HF_TOKEN': '{{ RUNPOD_SECRET_HF_TOKEN }}'}))")
-runpodctl template create \
-  --name qwen3.6-27b-awq-vllm \
-  --image "$IMAGE" \
+  'HF_TOKEN': '{{ RUNPOD_SECRET_HF_TOKEN }}',
+  'HF_HUB_ENABLE_HF_TRANSFER': '1'}))")
+TPL=$(runpodctl template create \
+  --name "qwen3.6-27b-awq-vllm-a6000-$SUFFIX" \
+  --image "ghcr.io/ediksimonian/runpod-cuda:main" \
   --serverless --container-disk-in-gb 30 \
   --volume-mount-path /runpod-volume \
-  --env "$ENV_JSON"
-# -> note template id
+  --env "$ENV_JSON" | jq -r .id)
 
-# 3. Endpoint
-runpodctl serverless create \
-  --name qwen3.6-27b-vllm-5090 \
-  --template-id <TEMPLATE_ID> \
-  --network-volume-id <VOLUME_ID> \
-  --data-center-ids US-IL-1 \
-  --gpu-id "NVIDIA GeForce RTX 5090" \
-  --gpu-count 1 --workers-min 0 --workers-max 1
-```
-
-Rationale for these settings:
-
-- **Custom image (not `runpod/worker-v1-vllm`)** — stock worker ships vLLM 0.15/0.16
-  which lack Qwen3.5 arch; our image uses vLLM 0.19.1 on CUDA 12.8. Must be rebuilt
-  and pushed from `docker/` before creating the template.
-- **`MAX_MODEL_LEN=8192`** — after 20.5 GB of AWQ weights on a 32 GB card, ~9 GB is
-  left for KV. 16 users × 8 k context ≈ 34 k tokens total, fits. Raising context or
-  concurrency will cause vLLM preemption. Bump either only when moving to H100.
-- **`MAX_NUM_SEQS=16`** — matches the 16-user target.
-- **`workers-min=0 max=1`** — single worker, scale to zero when idle.
-- **`HF_HOME=/runpod-volume/huggingface-cache/hub`** — matches the path baked into
-  the image ENV, persists the 20 GB download across cold starts.
-- **`HF_TOKEN`** resolves via RunPod secret (console-only at
-  <https://www.runpod.io/console/user/secrets>). Already created.
-
-Once deployed (replace `<ENDPOINT_ID>` with the id from `runpodctl serverless create`):
-```bash
-KEY=$(grep apikey ~/.runpod/config.toml | sed "s/.*= *'\([^']*\).*/\1/")
-
-# Smoke test
-curl -sS https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1/chat/completions \
+# Attach GHCR registry auth
+curl -sS -X PATCH "https://rest.runpod.io/v1/templates/$TPL" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"cyankiwi/Qwen3.6-27B-AWQ-INT4","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
+  -d "{\"containerRegistryAuthId\":\"$GHCR_AUTH\"}" > /dev/null
 
-# Watch worker state
-curl -sS https://api.runpod.ai/v2/<ENDPOINT_ID>/health -H "Authorization: Bearer $KEY"
+# 3. Endpoint (workers-min=1 holds the host through first image pull — avoids
+#    the throttle-and-redeploy loop on low-stock DCs)
+EP=$(runpodctl serverless create \
+  --name "qwen3.6-27b-vllm-a6000-$SUFFIX" \
+  --template-id "$TPL" \
+  --network-volume-id "$VOL" \
+  --data-center-ids EU-SE-1 \
+  --gpu-id "NVIDIA RTX A6000" \
+  --gpu-count 1 --workers-min 1 --workers-max 1 | jq -r .id)
+
+echo "VOL=$VOL TPL=$TPL EP=$EP"
+
+# 4. Verify (takes ~10–15 min for first cold boot)
+python tests/run_tests.py "$EP"
+
+# 5. After tests pass, drop workers-min to 0 via REST (saves idle cost)
+curl -sS -X PATCH "https://rest.runpod.io/v1/endpoints/$EP" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"workersMin":0}' > /dev/null
 ```
 
-## Upgrade path — H100 80GB in US-KS-2 (FP8)
+## Upgrade path — H100 80GB (FP8)
 
-Why: more headroom, higher context, FP8 quality. `runpodctl serverless update` has no
-`--gpu-id` flag and H100 isn't in US-IL-1, so the endpoint and volume must be recreated
-in a new DC.
-
-On H100 hosts you could theoretically drop our custom image and go back to
-`runpod/worker-v1-vllm:v2.14.0` (cuda 12.9.1 is fine on Hopper), BUT that image still
-has vLLM 0.16.0 which lacks Qwen3.5. **Keep using the same custom image** — vLLM 0.19.1
-also runs fine on H100.
+Drop to FP8 weights, raise MAX_MODEL_LEN and MAX_NUM_SEQS. Same docker-cuda
+image. DCs with H100 + volume support: `US-KS-2, US-GA-2, US-CA-2, US-MO-1,
+US-NE-1`. Check stock with `runpodctl datacenter list` first.
 
 ```bash
-IMAGE="ghcr.io/ediksimonian/runpod-cuda:main"
+# 1. New volume in target DC (50 GB for FP8 ~31 GB + HF cache + headroom)
+runpodctl network-volume create --name qwen3-models-us-ks --size 50 \
+  --data-center-id US-KS-2
 
-# 1. New volume (50 GB fits FP8 weights ~31 GB + HF cache + headroom)
-runpodctl network-volume create --name qwen3-models-us-ks --size 50 --data-center-id US-KS-2
-
-# 2. Retune template env for H100 / FP8
+# 2. Retune template env — change MODEL_NAME + drop QUANTIZATION + bump ctx/seqs
 ENV_JSON=$(python3 -c "import json; print(json.dumps({
   'MODEL_NAME': 'Qwen/Qwen3.6-27B-FP8',
   'MAX_MODEL_LEN': '32768',
   'GPU_MEMORY_UTILIZATION': '0.90',
   'MAX_NUM_SEQS': '32',
+  'LIMIT_MM_PER_PROMPT': '{"image":5,"video":2}',
   'ENABLE_AUTO_TOOL_CHOICE': 'true',
   'TOOL_CALL_PARSER': 'hermes',
   'TRUST_REMOTE_CODE': 'true',
   'BASE_PATH': '/runpod-volume',
   'HF_HOME': '/runpod-volume/huggingface-cache/hub',
-  'HF_TOKEN': '{{ RUNPOD_SECRET_HF_TOKEN }}'}))")
+  'HF_TOKEN': '{{ RUNPOD_SECRET_HF_TOKEN }}',
+  'HF_HUB_ENABLE_HF_TRANSFER': '1'}))")
 runpodctl template update <TEMPLATE_ID> --env "$ENV_JSON"
-# drop QUANTIZATION — vLLM auto-detects FP8
 
-# 3. Recreate endpoint (delete first to avoid double-billing)
+# 3. Delete old endpoint, create new one on H100 + new volume
 runpodctl serverless delete <OLD_ENDPOINT_ID>
 runpodctl serverless create \
   --name qwen3.6-27b-vllm-h100 \
@@ -301,25 +451,20 @@ runpodctl serverless create \
   --gpu-count 1 --workers-min 0 --workers-max 3
 ```
 
-DCs with H100 in USA: `US-KS-2`, `US-GA-2`, `US-CA-2`, `US-TX-3`. Check stock with
-`runpodctl datacenter list` before creating the volume.
+## Upgrade path — AMD MI300X (BF16)
 
-## Upgrade path — AMD MI300X 192GB in EU-RO-1 (FP16 / BF16)
+Why: 192 GB VRAM + 5.3 TB/s memory bandwidth. Full BF16 with huge KV cache for
+32+ users, no quantization loss. **Availability: EU-RO-1 only, Low stock,
+secure cloud only** — the "community MI300X" $0.50/hr price RunPod displays is
+phantom (the `communityCloud: false` flag on the GPU type confirms no community
+providers offer it).
 
-Why: ~1.6× the memory bandwidth of H100 (5.3 vs 3.35 TB/s → faster decode), 192 GB
-VRAM lets you run Qwen3.6-27B in full BF16 with massive KV cache for 32+ users, no
-quantization loss. Usually cheaper per hour than H100. Tradeoff: EU-only (no US
-MI300X), less mature quant kernels (doesn't matter here since we're running full
-precision), prefill of long prompts still faster on H100.
-
-Availability: `EU-RO-1` only, Low stock. `runpodctl datacenter list` to confirm.
-
-Use the ROCm image from `docker-rocm/` — same worker-vllm handler, AMD base.
 ```bash
 IMAGE="ghcr.io/ediksimonian/runpod-rocm:main"
 
-# 1. EU volume. BF16 weights for Qwen3.6-27B ~= 54 GB → size at 100 GB
-runpodctl network-volume create --name qwen3-models-eu-ro --size 100 --data-center-id EU-RO-1
+# 1. EU volume (100 GB fits BF16 ~54 GB + HF cache + other quants later)
+runpodctl network-volume create --name qwen3-models-eu-ro --size 100 \
+  --data-center-id EU-RO-1
 
 # 2. Template
 ENV_JSON=$(python3 -c "import json; print(json.dumps({
@@ -328,12 +473,14 @@ ENV_JSON=$(python3 -c "import json; print(json.dumps({
   'GPU_MEMORY_UTILIZATION': '0.90',
   'MAX_NUM_SEQS': '32',
   'DTYPE': 'bfloat16',
+  'LIMIT_MM_PER_PROMPT': '{"image":5,"video":2}',
   'ENABLE_AUTO_TOOL_CHOICE': 'true',
   'TOOL_CALL_PARSER': 'hermes',
   'TRUST_REMOTE_CODE': 'true',
   'BASE_PATH': '/runpod-volume',
   'HF_HOME': '/runpod-volume/huggingface-cache/hub',
-  'HF_TOKEN': '{{ RUNPOD_SECRET_HF_TOKEN }}'}))")
+  'HF_TOKEN': '{{ RUNPOD_SECRET_HF_TOKEN }}',
+  'HF_HUB_ENABLE_HF_TRANSFER': '1'}))")
 runpodctl template create \
   --name qwen3.6-27b-bf16-vllm-rocm \
   --image "$IMAGE" \
@@ -348,27 +495,109 @@ runpodctl serverless create \
   --network-volume-id <NEW_VOLUME_ID> \
   --data-center-ids EU-RO-1 \
   --gpu-id "AMD Instinct MI300X OAM" \
-  --gpu-count 1 --workers-min 0 --workers-max 2
+  --gpu-count 1 --workers-min 1 --workers-max 2
 ```
 
-Verify the exact GPU ID string with `runpodctl gpu list` before running.
+## Lessons banked from this session
 
-## RunPod CLI gotchas
+- **Low-stock GPU DCs throttle mid-init.** On 5090 in US-IL-1 (Low stock) our
+  worker spent ~3 min `initializing` then RunPod reclaimed the host
+  (`throttled=1`) before the image pull finished. Retrying didn't help — same
+  pattern repeated. **Mitigation**: start new endpoints with `workers-min=1`
+  during the first cold boot to hold the host; drop to 0 after tests pass.
+- **Image pull is per-host.** FlashBoot biases toward cached hosts but can't
+  force it. First pull on a new host = full 8 GB transfer. On sparse-GPU DCs
+  you keep eating cold pulls until enough hosts cache the image.
+- **EUR-IS-2 has great 5090 stock but no volume support.** Error text:
+  `"Data center EUR-IS-2 not found or does not support network volumes"`. DCs
+  that do support volumes:
+  `AP-JP-1, CA-MTL-3, CA-MTL-4, EU-CZ-1, EU-NL-1, EU-RO-1, EU-SE-1, EUR-IS-1,
+  EUR-IS-3, EUR-NO-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-MO-1, US-MO-2,
+  US-NC-1, US-NC-2, US-NE-1, US-TX-3, US-WA-1`.
+- **`cyankiwi/Qwen3.6-27B-AWQ-INT4` uses compressed-tensors format, not AWQ.**
+  The repo name is misleading. Read `config.json` → `quantization_config.format`
+  to pick the right vLLM `--quantization` arg.
+- **worker-vllm v2.14.0 is stale against vLLM 0.17+.** Upstream hasn't updated
+  engine.py in 6+ weeks. All the "updated" forks (YeDaxia, bgeneto, linllm)
+  bumped the pip pin but kept the broken imports; they'd crash the same way.
+  This is why we rewrote as a subprocess+HTTP proxy handler — decouples us from
+  vLLM's Python-API churn.
+- **vLLM 0.17+ API drift specifics** (for future archaeology):
+  - Removed `log_error_stack` kwarg from OpenAIServingChat / OpenAIServingCompletion
+  - Added required `openai_serving_render` kwarg (new class in
+    `vllm/entrypoints/serve/render/serving.py`) — no default
+  - Some kwargs moved from Chat into Render (chat_template,
+    trust_request_chat_template, enable_auto_tools, etc.)
+- **`--limit-mm-per-prompt` CLI format changed in vLLM 0.19.** Old format
+  `image=5,video=2` now errors with `cannot be converted to <function loads>`.
+  New format is **JSON**: `{"image":5,"video":2}`. The env var string passed
+  into the template must be the JSON representation, e.g.
+  `LIMIT_MM_PER_PROMPT: '{"image":5,"video":2}'`.
+- **"Phantom" community pricing.** RunPod's GraphQL `gpuTypes` returns a
+  `communityPrice` even for GPUs that have `communityCloud: false` (MI300X is
+  the case we hit — listed at $0.50/hr but no community provider actually
+  offers it; only secure cloud at $1.99). Always check `communityCloud` /
+  `secureCloud` booleans before trusting a price.
+- **Template name collisions are sticky.** RunPod soft-deletes templates and
+  the names remain reserved. Always append `-$(date +%H%M%S)` to template +
+  endpoint names.
 
-- `runpodctl serverless create` has no `--scaler-type`/`--scaler-value`/`--idle-timeout`
-  flags; create first, then `runpodctl serverless update <id>` for those.
-- `runpodctl serverless update` has no `--gpu-id` — changing GPU means delete + recreate.
-- `runpodctl template create/update` has no `--volume-mount-path` on update and the
-  create flag is effectively ignored for serverless (volumes always mount at
-  `/runpod-volume`). Pin `BASE_PATH=/runpod-volume` in env to be defensive.
-- RunPod **secrets** are manageable via GraphQL `secretCreate`/`secretDelete` mutations
-  (`https://api.runpod.io/graphql`), or via the console at
-  <https://www.runpod.io/console/user/secrets>. REST and runpodctl do not expose them.
-  Reference them in env as `{{ RUNPOD_SECRET_<NAME> }}`.
-- No CLI/REST field selects **Load Balancer** endpoint type — only the console UI does.
-- Network volumes are **region-locked**; changing DC requires a new volume + re-download.
-- **5090 hosts reject CUDA ≥ 12.9 images.** Blackwell drivers currently top out at CUDA
-  12.8. Any image using a `nvidia/cuda:12.9*` base (including stock
-  `runpod/worker-v1-vllm:v2.13+`) will hit `nvidia-container-cli: requirement error:
-  unsatisfied condition: cuda>=12.9`. Our custom image uses the 12.8 base for this
-  reason.
+## RunPod CLI + API gotchas
+
+- `runpodctl template list` **returns only RunPod-public templates**, not the
+  user's own. Use the REST API for user templates:
+  ```bash
+  curl -sS "https://rest.runpod.io/v1/templates" -H "Authorization: Bearer $KEY"
+  ```
+- `runpodctl serverless create` has no `--scaler-type` / `--scaler-value` /
+  `--idle-timeout` / `--execution-timeout` flags; create first, then
+  `runpodctl serverless update <id>` for those.
+- `runpodctl serverless update` has no `--gpu-id` — changing GPU means
+  delete + recreate.
+- `runpodctl template create/update` has no `--container-registry-auth-id`
+  flag. Attach via REST PATCH
+  `{"containerRegistryAuthId":"..."}` after creation.
+- `runpodctl template create/update` has no `--volume-mount-path` on update,
+  and the create flag is effectively ignored for serverless (volumes always
+  mount at `/runpod-volume`). Pin `BASE_PATH=/runpod-volume` in env.
+- RunPod **secrets** are manageable via GraphQL `secretCreate` / `secretDelete`
+  mutations (`https://api.runpod.io/graphql?api_key=$KEY`), or via the console
+  at <https://www.runpod.io/console/user/secrets>. REST and runpodctl don't
+  expose them. Reference in env as `{{ RUNPOD_SECRET_<NAME> }}`.
+- No CLI/REST field selects **Load Balancer** endpoint type — only the console
+  UI. That's why we're on queue-based serverless (which is fine — vLLM's
+  batching is the real concurrency win).
+- Network volumes are **region-locked**; changing DC requires a new volume.
+- **5090 hosts reject CUDA ≥ 12.9 images.** Blackwell drivers top out at 12.8.
+  Any image with `nvidia/cuda:12.9*` base (e.g. stock
+  `runpod/worker-v1-vllm:v2.13+`) fails with `nvidia-container-cli: requirement
+  error: unsatisfied condition: cuda>=12.9`. Our docker-cuda image pins the
+  12.8 base for this reason.
+- Worker logs are only accessible via the RunPod console (**Serverless → endpoint
+  → Workers → click worker → Logs**). No REST or runpodctl command returns
+  them. They're purged when the worker terminates.
+
+## Claude Code integration (not yet done)
+
+Claude Code speaks the **Anthropic Messages API**, not OpenAI. Point it at a
+translation proxy:
+
+```bash
+pip install 'litellm[proxy]'
+
+# litellm_config.yaml
+model_list:
+  - model_name: qwen3.6-27b
+    litellm_params:
+      model: openai/cyankiwi/Qwen3.6-27B-AWQ-INT4
+      api_base: https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1
+      api_key: os.environ/RUNPOD_API_KEY
+
+litellm --config litellm_config.yaml --port 4000
+```
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_AUTH_TOKEN=anything  # LiteLLM auth
+claude
+```
