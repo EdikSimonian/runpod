@@ -1,0 +1,73 @@
+name: Build & Push CUDA Image (5090 / H100)
+
+on:
+  push:
+    branches: [main]
+    tags: ["cuda-v*"]
+    paths:
+      - "docker-cuda/**"
+      - ".github/workflows/docker-cuda.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docker-cuda/**"
+      - ".github/workflows/docker-cuda.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}-cuda
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # vLLM + CUDA + FlashInfer + torch cu128 wheels weigh ~10 GB.
+      # Default GHA runner has ~14 GB free — purge pre-installed toolchains
+      # we don't need so the build has room to breathe.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=match,pattern=cuda-v(.*),group=1
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-cuda
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=cuda
+          cache-to: type=gha,mode=max,scope=cuda
