@@ -533,6 +533,35 @@ runpodctl serverless create \
   New format is **JSON**: `{"image":5,"video":2}`. The env var string passed
   into the template must be the JSON representation, e.g.
   `LIMIT_MM_PER_PROMPT: '{"image":5,"video":2}'`.
+- **Image CUDA toolchain MUST match the vLLM wheel's compiled CUDA toolchain.**
+  vLLM 0.19.1's published wheel embeds Marlin PTX compiled with CUDA 12.9.1
+  (per their `docker/Dockerfile`'s `ARG CUDA_VERSION=12.9.1`). If our image
+  uses any older CUDA base (e.g. 12.8), the wheel's PTX is rejected at engine
+  init with:
+  ```
+  torch.AcceleratorError: CUDA error: the provided PTX was compiled with an
+  unsupported toolchain
+  ```
+  triggered from `vllm/model_executor/kernels/linear/mixed_precision/marlin.py
+  ::transform_w_s` during `process_weights_after_loading`. **This is NOT a
+  host-driver problem and can't be fixed with `allowedCudaVersions`** — the
+  image itself ships PTX the runtime can't accept. Our `docker-cuda/Dockerfile`
+  pins to `nvidia/cuda:12.9.1-base` + cu129 torch wheels so it matches.
+  Trade: the resulting image won't run on RTX 5090 hosts (drivers cap at 12.8).
+- **`allowedCudaVersions` is the right tool for host-driver filtering**, but
+  only after you've matched the image's CUDA toolchain to the wheel. Set
+  `["12.9"]` on every endpoint via REST PATCH after creation
+  (`runpodctl serverless create` doesn't expose this flag):
+  ```bash
+  curl -sS -X PATCH "https://rest.runpod.io/v1/endpoints/$EP" \
+    -H "Authorization: Bearer $RUNPOD_API_KEY" -H "Content-Type: application/json" \
+    -d '{"allowedCudaVersions":["12.9"]}'
+  ```
+- **Blackwell silicon (sm_120) requires newer toolchain than vLLM 0.19.1
+  ships.** RTX PRO 6000 (Blackwell Server) and RTX 5090 fail with the same
+  PTX error even on hosts with new drivers, because vLLM's Marlin PTX simply
+  doesn't include sm_120. Stick to Ampere (A6000, A100), Hopper (H100, H200),
+  or Ada (L40, L40S, RTX 6000 Ada) until vLLM ≥ 0.20 lands with sm_120 PTX.
 - **"Phantom" community pricing.** RunPod's GraphQL `gpuTypes` returns a
   `communityPrice` even for GPUs that have `communityCloud: false` (MI300X is
   the case we hit — listed at $0.50/hr but no community provider actually

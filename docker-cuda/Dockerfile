@@ -1,29 +1,35 @@
-FROM nvidia/cuda:12.8.0-base-ubuntu22.04
+FROM nvidia/cuda:12.9.1-base-ubuntu22.04
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends python3-pip \
     && rm -rf /var/lib/apt/lists/*
-RUN ldconfig /usr/local/cuda-12.8/compat/
+RUN ldconfig /usr/local/cuda-12.9/compat/
 
 RUN python3 -m pip install --upgrade pip
 
-# Split vLLM's heavyweight install across three separate RUN steps so Docker
-# can pull them in parallel on first cold start. A single monolithic
-# `pip install vllm[flashinfer]` produces one ~7.4 GB layer that serializes
-# the pull; on a 20 MB/s host that's ~6 min wall time for one blob, since
-# Docker doesn't parallelize *within* a layer.
+# Base image and torch wheel CUDA version MUST match what vLLM's wheel was
+# compiled against. vLLM 0.19.1's official Dockerfile sets CUDA_VERSION=12.9.1
+# (https://github.com/vllm-project/vllm/blob/v0.19.1/docker/Dockerfile#L25),
+# so we mirror that. Using cu128 here would crash at engine init with
+# `torch.AcceleratorError: CUDA error: the provided PTX was compiled with an
+# unsupported toolchain` from Marlin during process_weights_after_loading,
+# because vLLM's published wheel embeds 12.9-targeted PTX that 12.8 hosts
+# can't decode.
 #
-# Three smaller concurrent layers (~3 GB + ~1.5 GB + ~2 GB) cut wall time
-# closer to ~3 min on the same host.
-#
-# Pins sourced from https://github.com/vllm-project/vllm/blob/v0.19.1/requirements/cuda.txt
-# Bump all four (torch, torchvision, torchaudio, flashinfer) together with
-# the vLLM version below if you upgrade.
+# Trade: this image will not run on RTX 5090 / Blackwell consumer hosts whose
+# drivers cap at CUDA 12.8. For 5090 we'd need to either (a) wait for vLLM
+# to ship a cu128-compatible wheel, or (b) build vLLM from source against
+# 12.8. Both out of scope.
+
+# Three separate RUN steps so Docker pulls layers in parallel on cold start
+# (vs one ~7 GB blob serialized over a single TCP stream). Pins sourced from
+# https://github.com/vllm-project/vllm/blob/v0.19.1/requirements/cuda.txt —
+# bump together with the vLLM version below.
 
 # Layer 1 — torch stack (~3 GB, biggest single chunk).
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
       "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0" \
-      --extra-index-url https://download.pytorch.org/whl/cu128
+      --extra-index-url https://download.pytorch.org/whl/cu129
 
 # Layer 2 — FlashInfer kernels (~1.5 GB).
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -34,7 +40,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # are already satisfied from layers 1 and 2, so pip skips them.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install "vllm==0.19.1" \
-      --extra-index-url https://download.pytorch.org/whl/cu128
+      --extra-index-url https://download.pytorch.org/whl/cu129
 
 COPY builder/requirements.txt /requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
