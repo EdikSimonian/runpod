@@ -232,7 +232,7 @@ pulls with anonymous auth on public packages; we also have a registered GHCR
 PAT as belt-and-suspenders (see "Reusable state" below).
 
 ### CUDA image (docker-cuda/)
-- Base: **`vllm/vllm-openai:v0.19.1`** (vLLM's official image). All toolchain
+- Base: **`vllm/vllm-openai:nightly`** (vLLM's official image). All toolchain
   pieces (CUDA toolkit, torch, flashinfer, vLLM, Marlin PTX) are guaranteed
   ABI-compatible by upstream construction. We tried building from
   `nvidia/cuda:12.8`/`12.9` + cu128/cu129 torch + pip-install vllm and it

@@ -6,9 +6,11 @@
 # wheel's compiled PTX didn't match our base toolkit. Using the upstream image
 # eliminates that variable entirely.
 #
-# Bump tag together with any vLLM version upgrade; available tags at
-# https://hub.docker.com/r/vllm/vllm-openai/tags
-FROM vllm/vllm-openai:v0.19.1
+# Currently on `:nightly` (post-0.19.1) to pick up bug fixes — `:v0.19.1`
+# reproducibly wedged under sustained traffic on Qwen3.6-27B-AWQ
+# (`/v1/models` would time out while RunPod still reported the worker as
+# `running=1`). Available tags at https://hub.docker.com/r/vllm/vllm-openai/tags
+FROM vllm/vllm-openai:nightly
 
 # Layer our handler's deps on top of vLLM's pre-baked environment.
 COPY builder/requirements.txt /requirements.txt
