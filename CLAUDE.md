@@ -2,16 +2,23 @@
 
 ## Pick up here next session
 
-**Endpoint and volume were torn down at pause time.** What survived is zero-cost
-to keep and reusable:
+**Everything purged on RunPod.** What survives at zero cost:
 
-| Resource | ID | Status |
+| Resource | ID / Path | Status |
 |---|---|---|
-| Template | `7rr31v1f4o` | still on RunPod, ready to attach to a new endpoint |
-| Registry auth | `cmoc95oxr0086jv06c3t9n2es` (`ghcr-ediksimonian`) | attached to template |
-| RunPod secret | `HF_TOKEN` (console-only) | template references it |
-| CUDA image | `ghcr.io/ediksimonian/runpod-cuda:main` (sha-bc34eda, public) | ready to pull |
-| ROCm image | `ghcr.io/ediksimonian/runpod-rocm:main` (public) | ready to pull |
+| RunPod secret | `HF_TOKEN` (console-only) | reusable; reference as `{{ RUNPOD_SECRET_HF_TOKEN }}` |
+| CUDA image | `ghcr.io/ediksimonian/runpod-cuda:main` | rebuilt on next push from new Dockerfile |
+| ROCm image | `ghcr.io/ediksimonian/runpod-rocm:main` | rebuilt on next push if its files change |
+
+What's NOT there anymore (need to recreate on resume):
+- Endpoint, volume, template, GHCR registry auth — all deleted
+
+The earlier registry auth ID `cmoc95oxr0086jv06c3t9n2es` is gone. To recreate:
+```bash
+runpodctl registry create --name ghcr-ediksimonian \
+  --username ediksimonian --password $(gh auth token)
+```
+The recorded template/endpoint/volume IDs across this doc (`7rr31v1f4o`, `vllm-*`, etc.) are all stale — for archeology only.
 
 **Resume steps** (~5 min of CLI + a cold-boot wait):
 
@@ -225,12 +232,19 @@ pulls with anonymous auth on public packages; we also have a registered GHCR
 PAT as belt-and-suspenders (see "Reusable state" below).
 
 ### CUDA image (docker-cuda/)
-- Base: `nvidia/cuda:12.8.0-base-ubuntu22.04` (5090 hosts reject CUDA ≥ 12.9 —
-  Blackwell drivers top out at 12.8).
-- Pip: `vllm[flashinfer]==0.19.1` + cu128 torch wheels.
-- Runs on 5090 (Blackwell), A6000 (Ampere), H100 (Hopper) — same image, the GPU
-  choice lives on the endpoint.
-- Compressed size: ~8 GB.
+- Base: **`vllm/vllm-openai:v0.19.1`** (vLLM's official image). All toolchain
+  pieces (CUDA toolkit, torch, flashinfer, vLLM, Marlin PTX) are guaranteed
+  ABI-compatible by upstream construction. We tried building from
+  `nvidia/cuda:12.8`/`12.9` + cu128/cu129 torch + pip-install vllm and it
+  reliably crashed with `cudaErrorUnsupportedPtxVersion` from Marlin during
+  engine init — the wheel's compiled PTX never matched our base toolkit.
+- Our Dockerfile only adds three things on top: `runpod` + `httpx` +
+  `hf-transfer` deps, our `src/handler.py`, and an `ENTRYPOINT []` reset to
+  override the upstream image's default entrypoint.
+- Runs on Ampere (A6000, A100), Hopper (H100, H200), Ada (L40, L40S, RTX 6000
+  Ada). Will NOT run on Blackwell (RTX 5090, RTX PRO 6000 Blackwell, B200) —
+  vLLM 0.19.1's wheel doesn't ship sm_120 PTX.
+- Compressed size: ~9 GB.
 
 ### ROCm image (docker-rocm/)
 - Base: `rocm/vllm-dev:preview_releases_v0.20.0_20260422` (AMD-published, vLLM
