@@ -1,113 +1,105 @@
-# RunPod — Qwen3.6-27B vLLM deployments
+# Qwen3.6-27B serving for Claude Code
 
 ## Pick up here next session
 
-**Everything purged on RunPod.** What survives at zero cost:
+**Active path: Hot Aisle bare-metal MI300X + SGLang + LiteLLM proxy → Claude Code.**
+RunPod path is dead (kept below for archaeology). Validated 2026-05-04 with
+sustained 16-concurrent load + Stage-3 EAGLE speculative decoding. Single-stream
+decode **~190 tok/s**, ~5.4× over the vanilla baseline.
 
-| Resource | ID / Path | Status |
+**Operational docs live in [`workshop/README.md`](./workshop/README.md).**
+Start there for resume steps, layout, and the bug-and-workaround table.
+
+What survives across sessions (zero cost):
+
+| Resource | Reference | Notes |
 |---|---|---|
-| RunPod secret | `HF_TOKEN` (console-only) | reusable; reference as `{{ RUNPOD_SECRET_HF_TOKEN }}` |
-| CUDA image | `ghcr.io/ediksimonian/runpod-cuda:main` | rebuilt on next push from new Dockerfile |
-| ROCm image | `ghcr.io/ediksimonian/runpod-rocm:main` | rebuilt on next push if its files change |
+| Hot Aisle account | team `edik-simonians-team` | check balance: `hotaisle team balance --handle edik-simonians-team \| jq` |
+| Custom SGLang image | `ghcr.io/ediksimonian/qwen-sglang-rocm:main` | currently private; flip with `gh api -X PATCH /user/packages/container/qwen-sglang-rocm -f visibility=public` |
+| LiteLLM master key | `workshop/lib/env.local.sh` (gitignored, chmod 600) | preserved across reprovisions; `bring-up.sh` mints a new one if missing |
+| HF_TOKEN | `workshop/lib/env.local.sh` | local file, gitignored |
 
-What's NOT there anymore (need to recreate on resume):
-- Endpoint, volume, template, GHCR registry auth — all deleted
+What's purged at session end:
+- Hot Aisle VM (delete via `hotaisle vm delete --team edik-simonians-team --vm <name>`)
+- Laptop SSH tunnel + LiteLLM container
 
-The earlier registry auth ID `cmoc95oxr0086jv06c3t9n2es` is gone. To recreate:
+### Resume in 4 commands (≈20 min wall, ≈$2 of GPU time)
+
 ```bash
-runpodctl registry create --name ghcr-ediksimonian \
-  --username ediksimonian --password $(gh auth token)
+# 1. provision a new 1× MI300X
+bash workshop/scripts/hotaisle-bring-up.sh
+
+# 2. on the VM: install docker, pull base image, build derivative, launch SGLang
+. workshop/lib/env.local.sh
+scp -P 22 -r workshop/{hotaisle,quality-battery,sglang-rocm-image} hotaisle@$VM_SSH_HOST:~/
+ssh -p 22 hotaisle@$VM_SSH_HOST 'bash ~/hotaisle/vm-prep.sh \
+  && docker pull ghcr.io/ediksimonian/qwen-sglang-rocm:main \
+  && docker tag ghcr.io/ediksimonian/qwen-sglang-rocm:main qwen-sglang:rocm720-aiter112-sgmain'
+# (or build from source: cd ~/sglang-rocm-image && docker build -t qwen-sglang:rocm720-aiter112-sgmain .)
+
+# stage HF + SGLang secrets, launch
+ssh -p 22 hotaisle@$VM_SSH_HOST "cat > /tmp/launch-env.sh <<EOF
+export HF_TOKEN='$HF_TOKEN'
+export SGLANG_API_KEY='$SGLANG_API_KEY'
+export SGLANG_ADMIN_API_KEY='$SGLANG_ADMIN_API_KEY'
+EOF
+chmod 600 /tmp/launch-env.sh"
+ssh -p 22 hotaisle@$VM_SSH_HOST 'set -a; . /tmp/launch-env.sh; set +a; bash ~/hotaisle/launch-qwen.sh'
+
+# 3. laptop side: tunnel + LiteLLM container
+bash workshop/scripts/bring-up.sh
+
+# 4. run claude
+export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_AUTH_TOKEN=$LITELLM_MASTER_KEY
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
+claude
 ```
-The recorded template/endpoint/volume IDs across this doc (`7rr31v1f4o`, `vllm-*`, etc.) are all stale — for archeology only.
 
-**Resume steps** (~5 min of CLI + a cold-boot wait):
-
-1. **Commit the local split-Dockerfile change first** so the next build picks
-   up the layer-splitting optimization:
-   ```bash
-   git diff docker-cuda/Dockerfile    # review
-   git add docker-cuda/Dockerfile CLAUDE.md
-   git commit -m "Split CUDA Dockerfile into torch/flashinfer/vllm layers"
-   git push origin main
-   # Wait ~15 min for GHA to rebuild and push a new :main image
-   ```
-
-2. **Recreate volume + endpoint** (template already exists and is wired up):
-   ```bash
-   SUFFIX=$(date +%H%M%S)
-   VOL=$(runpodctl network-volume create \
-     --name "qwen3-models-eu-se-$SUFFIX" --size 30 \
-     --data-center-id EU-SE-1 | jq -r .id)
-   EP=$(runpodctl serverless create \
-     --name "qwen3.6-27b-vllm-a6000-$SUFFIX" \
-     --template-id 7rr31v1f4o \
-     --network-volume-id "$VOL" \
-     --data-center-ids EU-SE-1 \
-     --gpu-id "NVIDIA RTX A6000" \
-     --gpu-count 1 --workers-min 1 --workers-max 1 | jq -r .id)
-   echo "VOL=$VOL EP=$EP"
-   ```
-
-3. **Watch the cold boot** (expect ~8–12 min if split-Dockerfile change landed,
-   otherwise ~12–15 min):
-   ```bash
-   KEY=$(grep apikey ~/.runpod/config.toml | sed "s/.*= *'\([^']*\).*/\1/")
-   watch -n 20 "curl -sS https://api.runpod.ai/v2/$EP/health -H 'Authorization: Bearer \$KEY' | jq .workers"
-   ```
-
-4. **Verify with canonical tests** (both should PASS now that
-   `LIMIT_MM_PER_PROMPT` JSON format is in the template):
-   ```bash
-   python tests/run_tests.py "$EP"
-   ```
-
-5. **Fire a real `/openai/v1` request** (what LiteLLM + Claude Code will do):
-   ```bash
-   curl -sS https://api.runpod.ai/v2/$EP/openai/v1/chat/completions \
-     -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-     -d '{"model":"cyankiwi/Qwen3.6-27B-AWQ-INT4","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
-   ```
-
-6. **After green**, drop Active-tier billing:
-   ```bash
-   curl -sS -X PATCH "https://rest.runpod.io/v1/endpoints/$EP" \
-     -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-     -d '{"workersMin":0}'
-   ```
-
-7. **Wire up LiteLLM + Claude Code** — recipe at the bottom of this file.
-
-**Uncommitted working-tree changes at session end** (check `git status`):
-- `docker-cuda/Dockerfile` — three-way layer split (torch / flashinfer / vllm)
-  so parallel-pull halves first-boot time. Pins torch 2.10.0, flashinfer 0.6.6
-  per vLLM 0.19.1 `requirements/cuda.txt`.
-- `CLAUDE.md` — this document itself.
-- Also `D server.py D start.sh` — leftover Ollama-era files that were removed
-  from the working tree long ago but not staged. Decide separately.
-
-**Known issues resolved but not yet end-to-end verified:**
-- `log_error_stack` vLLM-0.19 API drift → solved by replacing worker-vllm's
-  Python wrapper with the subprocess HTTP proxy handler.
-- `compressed-tensors` vs `awq` quant mismatch → `QUANTIZATION=compressed-tensors`
-  in template env.
-- `LIMIT_MM_PER_PROMPT` format change from `image=5,video=2` →
-  `{"image":5,"video":2}` → template env now uses JSON.
-
-Expected spend to green-light on resume: ~$0.50–1.00 of Active-tier billing
-during the final cold boot + test run.
-
-**If you want to wipe everything instead of resuming:**
+Tear down at end of session:
 ```bash
-runpodctl template delete 7rr31v1f4o
-runpodctl registry delete cmoc95oxr0086jv06c3t9n2es
-# HF_TOKEN secret: delete in the console at
-# https://www.runpod.io/console/user/secrets
-# GHCR images cost nothing to leave; delete at
-# https://github.com/EdikSimonian?tab=packages if you want
+bash workshop/scripts/hotaisle-tear-down.sh   # deletes VM
+docker rm -f workshop-litellm workshop-litellm-db
+pkill -f 'ssh -N.*-L 30000:127.0.0.1:30000'
 ```
+
+### Known speed ceiling
+
+~190 tok/s single-stream is the practical limit on **1× MI300X with this stack**.
+FP8 doesn't help (Triton attention is BF16-bound, AITER GDN broken upstream).
+INT4 cyankiwi quant doesn't load (compressed-tensors scheme registry gap).
+2× MI300X (TP=2) would recover most of the speed — costs $3.98/hr instead of $1.99.
+
+Full benchmark numbers + tunable levers in
+[`workshop/sglang-rocm-image/BENCHMARKS.md`](./workshop/sglang-rocm-image/BENCHMARKS.md).
+
+### Open upstream blocker affecting Claude Code UX
+
+LiteLLM's anthropic streaming bridge emits malformed SSE for `reasoning_content`
+chunks (opens `text` content_block but ships `thinking_delta` events inside).
+Tracked at [LiteLLM PR #25212](https://github.com/BerriAI/litellm/pull/25212),
+**open and unmerged**. Workaround:
+`extra_body.chat_template_kwargs.enable_thinking: false` on each model in
+`workshop/litellm/litellm_config.yaml` — Qwen skips the `<think>` preamble entirely.
+Loses chain-of-thought visibility, gains snappy streaming. Apply the PR locally
+when we want both.
 
 ---
 
+# RunPod path — DEAD (archaeology only)
+
+The section below is the last known state of the RunPod-serverless attempt.
+**Do NOT follow these resume steps** — they reference templates, endpoints,
+volumes, and registry auth IDs that have all been deleted, and the worker-vllm
+stack has its own broken-Python-wrapper problems we worked around by moving to
+SGLang on Hot Aisle. Kept for context if you ever need to revisit the RunPod
+serverless fork.
+
+<details>
+<summary>Old RunPod resume steps (stale)</summary>
+
+Everything below is preserved verbatim from the pre-Hot-Aisle session in case
+the model name / Dockerfile decisions / quant gotchas are useful reference.
 
 ## Target model: Qwen3.6-27B (locked)
 
@@ -644,3 +636,5 @@ export ANTHROPIC_BASE_URL=http://localhost:4000
 export ANTHROPIC_AUTH_TOKEN=anything  # LiteLLM auth
 claude
 ```
+
+</details>

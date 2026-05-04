@@ -1,0 +1,179 @@
+{
+  "_comment": "Starter quality battery for FP8 KV validation. Codex recommended 20 tool + 10 JSON + 10 code + 5 NIH + 5 multi-turn + 5 vision = 55 cases minimum. This file ships with ~3 per category as examples; expand BEFORE running A1 if you want statistical confidence.",
+  "_format": "Each case has id, category, messages (OpenAI format), max_tokens, optional tools, optional check (regex/json_schema/contains)",
+  "cases": [
+    {
+      "id": "tool-001-simple-bash",
+      "category": "tool",
+      "messages": [
+        {"role": "system", "content": "You are a coding assistant. Use the bash tool to answer."},
+        {"role": "user", "content": "What is the current date in ISO format? Use the bash tool."}
+      ],
+      "tools": [
+        {"type": "function", "function": {"name": "bash", "description": "Run a bash command", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}
+      ],
+      "max_tokens": 256,
+      "check": {"kind": "tool_call_name", "value": "bash"}
+    },
+    {
+      "id": "tool-002-nested-args",
+      "category": "tool",
+      "messages": [
+        {"role": "system", "content": "You are a coding assistant."},
+        {"role": "user", "content": "Search for all .py files modified in the last day and return them as JSON list with name and size."}
+      ],
+      "tools": [
+        {"type": "function", "function": {"name": "search_files", "description": "Search files with filters", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "modified_since_days": {"type": "integer"}, "fields": {"type": "array", "items": {"type": "string"}}}, "required": ["pattern"]}}}
+      ],
+      "max_tokens": 256,
+      "check": {"kind": "tool_call_name", "value": "search_files"}
+    },
+    {
+      "id": "tool-003-multi-step",
+      "category": "tool",
+      "messages": [
+        {"role": "system", "content": "You are a coding assistant. Read files before editing."},
+        {"role": "user", "content": "Add a docstring to the function `parse_args` in main.py"}
+      ],
+      "tools": [
+        {"type": "function", "function": {"name": "read_file", "description": "Read a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+        {"type": "function", "function": {"name": "edit_file", "description": "Edit a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, "required": ["path", "old", "new"]}}}
+      ],
+      "max_tokens": 256,
+      "check": {"kind": "tool_call_name", "value": "read_file"}
+    },
+    {
+      "id": "json-001-strict-schema",
+      "category": "json",
+      "messages": [
+        {"role": "system", "content": "Reply with JSON only, no prose."},
+        {"role": "user", "content": "Generate a user record: name 'Alice', age 30, email 'alice@example.com', is_admin true."}
+      ],
+      "max_tokens": 128,
+      "check": {"kind": "json_schema", "schema": {"type": "object", "required": ["name", "age", "email", "is_admin"], "properties": {"name": {"type": "string"}, "age": {"type": "integer"}, "email": {"type": "string"}, "is_admin": {"type": "boolean"}}}}
+    },
+    {
+      "id": "json-002-nested",
+      "category": "json",
+      "messages": [
+        {"role": "system", "content": "Reply with JSON only."},
+        {"role": "user", "content": "Generate an order: id 'ORD-42', items [{'sku': 'A1', 'qty': 2}, {'sku': 'B2', 'qty': 1}], total 99.99."}
+      ],
+      "max_tokens": 256,
+      "check": {"kind": "json_valid"}
+    },
+    {
+      "id": "code-001-fizzbuzz",
+      "category": "code",
+      "messages": [
+        {"role": "system", "content": "Reply with Python code only, no markdown fences, no prose."},
+        {"role": "user", "content": "Write a fizzbuzz function that takes n and returns a list of strings."}
+      ],
+      "max_tokens": 256,
+      "check": {"kind": "python_assert", "asserts": ["fizzbuzz(15)[2] == 'Fizz'", "fizzbuzz(15)[4] == 'Buzz'", "fizzbuzz(15)[14] == 'FizzBuzz'"]}
+    },
+    {
+      "id": "code-002-json-validator",
+      "category": "code",
+      "messages": [
+        {"role": "system", "content": "Reply with Python code only, no markdown fences, no prose."},
+        {"role": "user", "content": "Write a function `is_email(s: str) -> bool` that returns True for strings matching basic email format."}
+      ],
+      "max_tokens": 256,
+      "check": {"kind": "python_assert", "asserts": ["is_email('a@b.c') == True", "is_email('not-an-email') == False"]}
+    },
+    {
+      "id": "nih-001-near-end-8k",
+      "category": "needle",
+      "messages": [
+        {"role": "user", "content": "<<INJECT_FILLER_8K>>The secret code is BANANA-7714. <<INJECT_FILLER_8K>>What is the secret code?"}
+      ],
+      "max_tokens": 32,
+      "check": {"kind": "contains", "value": "BANANA-7714"}
+    },
+    {
+      "id": "nih-002-middle-32k",
+      "category": "needle",
+      "messages": [
+        {"role": "user", "content": "<<INJECT_FILLER_16K>>The secret code is MELON-3309. <<INJECT_FILLER_16K>>What is the secret code?"}
+      ],
+      "max_tokens": 32,
+      "check": {"kind": "contains", "value": "MELON-3309"}
+    },
+    {
+      "id": "nih-003-near-start-60k",
+      "category": "needle",
+      "messages": [
+        {"role": "user", "content": "The secret code is GUAVA-5521. <<INJECT_FILLER_60K>>What is the secret code? Reply only with the code."}
+      ],
+      "max_tokens": 32,
+      "check": {"kind": "contains", "value": "GUAVA-5521"}
+    },
+    {
+      "id": "multiturn-001-tool-loop",
+      "category": "multiturn",
+      "messages": [
+        {"role": "system", "content": "You are a coding assistant."},
+        {"role": "user", "content": "Read the file config.yaml and tell me the value of `port`."},
+        {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"config.yaml\"}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "host: 0.0.0.0\nport: 8080\nworkers: 4"},
+        {"role": "user", "content": "Now tell me the workers count."}
+      ],
+      "tools": [
+        {"type": "function", "function": {"name": "read_file", "description": "Read a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+      ],
+      "max_tokens": 64,
+      "check": {"kind": "contains", "value": "4"}
+    },
+    {
+      "id": "ml-001-zh-summary",
+      "category": "multilingual",
+      "messages": [
+        {"role": "user", "content": "用中文一句话描述夏天的特征。"}
+      ],
+      "max_tokens": 128,
+      "check": {"kind": "non_ascii_min", "value": 5}
+    },
+    {
+      "id": "ml-002-ja-tools",
+      "category": "multilingual",
+      "messages": [
+        {"role": "system", "content": "あなたはプログラミングアシスタントです。bashツールを使って答えてください。"},
+        {"role": "user", "content": "現在の日付をISO形式で取得してください。"}
+      ],
+      "tools": [
+        {"type": "function", "function": {"name": "bash", "description": "Run a bash command", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}
+      ],
+      "max_tokens": 256,
+      "check": {"kind": "tool_call_name", "value": "bash"}
+    },
+    {
+      "id": "ml-003-es-code",
+      "category": "multilingual",
+      "messages": [
+        {"role": "system", "content": "Responde solo con código Python, sin markdown ni prosa."},
+        {"role": "user", "content": "Escribe una función fizzbuzz(n) que devuelva una lista de cadenas."}
+      ],
+      "max_tokens": 256,
+      "check": {"kind": "python_assert", "asserts": ["fizzbuzz(15)[2] == 'Fizz'", "fizzbuzz(15)[4] == 'Buzz'", "fizzbuzz(15)[14] == 'FizzBuzz'"]}
+    },
+    {
+      "id": "ml-004-mixed-zh-en",
+      "category": "multilingual",
+      "messages": [
+        {"role": "user", "content": "Translate to Chinese: 'The quick brown fox jumps over the lazy dog.' Reply with only the translation."}
+      ],
+      "max_tokens": 64,
+      "check": {"kind": "non_ascii_min", "value": 5}
+    },
+    {
+      "id": "ml-005-ar-summary",
+      "category": "multilingual",
+      "messages": [
+        {"role": "user", "content": "صف فصل الصيف في جملة واحدة باللغة العربية."}
+      ],
+      "max_tokens": 128,
+      "check": {"kind": "non_ascii_min", "value": 5}
+    }
+  ]
+}
