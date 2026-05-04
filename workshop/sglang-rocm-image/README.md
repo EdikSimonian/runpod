@@ -82,10 +82,25 @@ but produces garbled output:
 
 ## Published image
 
-`ghcr.io/ediksimonian/qwen-sglang-rocm:main` (mirrors `latest`)
+`ghcr.io/ediksimonian/qwen-sglang-rocm:main` — currently pinned to SGLang
+main commit `05aed5e1d` (2026-04-30, includes PR #23062).
 
-Tags follow `ghcr.io/ediksimonian/qwen-sglang-rocm:sg-<short-sha>` for SGLang
-commit pins.
+Also tagged: `ghcr.io/ediksimonian/qwen-sglang-rocm:sg-05aed5e1d` for an
+exact-commit pull.
+
+To bump: rebuild on a host with the rocm720 base image cached, retag with
+the new short SHA, push.
+
+## Performance
+
+See [BENCHMARKS.md](./BENCHMARKS.md) for measured single-stream and
+16-concurrent numbers, FP8-vs-BF16 results, cuda-graph impact, and
+findings on what didn't work (INT4 AWQ, latest-rocm tag).
+
+**TL;DR:** BF16 is the right choice on this stack today. FP8 loads
+correctly with the rebuilt image but runs at ~half BF16's decode speed
+because attention stays Triton/BF16-bound and aiter's FP8 GEMM lacks
+tuned configs for Qwen3.6 shapes.
 
 ## Pushing manually (no CI)
 
