@@ -1,0 +1,82 @@
+# LiteLLM config for the workshop. NO secrets in this file — values come
+# from env vars at runtime via LiteLLM's `os.environ/<NAME>` syntax.
+#
+# bring-up.sh / fallback-h100.sh export:
+#   SGLANG_API_KEY  — bearer token for SGLang
+#   MODEL_API_BASE  — http://<pod-tcp-host>:<pod-tcp-port>/v1
+#
+# Claude Code talks to LiteLLM at http://localhost:4000 (Anthropic Messages API).
+# LiteLLM forwards to SGLang at MODEL_API_BASE (OpenAI Chat Completions API).
+
+model_list:
+  - model_name: qwen3.6-27b
+    litellm_params:
+      model: openai/Qwen/Qwen3.6-27B
+      api_base: os.environ/MODEL_API_BASE
+      api_key: os.environ/SGLANG_API_KEY
+      # Disable Qwen3's <think>...</think> reasoning preamble. LiteLLM's
+      # anthropic streaming bridge currently emits malformed SSE for it
+      # (opens a text content_block but ships thinking_delta inside),
+      # which Claude Code's parser silently waits through. Until LiteLLM
+      # fixes the streaming translation, we route around it by telling
+      # SGLang's chat template to use the no-thinking variant.
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+  # Convenience aliases so Claude Code's default model names route here too
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/Qwen/Qwen3.6-27B
+      api_base: os.environ/MODEL_API_BASE
+      api_key: os.environ/SGLANG_API_KEY
+      # Disable Qwen3's <think>...</think> reasoning preamble. LiteLLM's
+      # anthropic streaming bridge currently emits malformed SSE for it
+      # (opens a text content_block but ships thinking_delta inside),
+      # which Claude Code's parser silently waits through. Until LiteLLM
+      # fixes the streaming translation, we route around it by telling
+      # SGLang's chat template to use the no-thinking variant.
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: openai/Qwen/Qwen3.6-27B
+      api_base: os.environ/MODEL_API_BASE
+      api_key: os.environ/SGLANG_API_KEY
+      # Disable Qwen3's <think>...</think> reasoning preamble. LiteLLM's
+      # anthropic streaming bridge currently emits malformed SSE for it
+      # (opens a text content_block but ships thinking_delta inside),
+      # which Claude Code's parser silently waits through. Until LiteLLM
+      # fixes the streaming translation, we route around it by telling
+      # SGLang's chat template to use the no-thinking variant.
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+litellm_settings:
+  # num_retries=1: a single retry on transient errors. Higher values amplify
+  # load on a single overloaded backend (Codex review 2026-05-03).
+  num_retries: 1
+  request_timeout: 600
+  # drop_params: true — Claude Code 2.x sends Anthropic-only fields like
+  # `context_management` that aren't OpenAI Chat Completions params; without
+  # dropping, LiteLLM 400s the request. We saw this loudly during validation
+  # (2026-05-04), now silencing for the workshop.
+  drop_params: true
+  # Force /v1/messages (Anthropic) → /v1/chat/completions translation. Without
+  # this, LiteLLM routes through its `experimental_pass_through/responses_adapters`
+  # path which calls /v1/responses — an OpenAI-proprietary endpoint that SGLang
+  # doesn't expose. Verified 2026-05-04 against Claude Code 2.x.
+  use_chat_completions_url_for_anthropic_messages: true
+
+router_settings:
+  routing_strategy: simple-shuffle
+  retry_after: 5
+
+general_settings:
+  # When set, requests must send Authorization: Bearer <master_key>. Also gates
+  # the /key/generate, /user/new admin endpoints (used to mint per-user virtual
+  # keys for workshop participants).
+  master_key: os.environ/LITELLM_MASTER_KEY
