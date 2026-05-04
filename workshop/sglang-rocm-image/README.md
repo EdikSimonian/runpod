@@ -32,39 +32,59 @@ docker build --build-arg SGLANG_REF=<sha-or-tag> \
 After build, the file `/sgl-workspace/SGLANG_VERSION.txt` inside the image
 records which SGLang commit was installed.
 
-## Run (Qwen3.6-27B-FP8 example)
+## Run (Qwen3.6-27B BF16 + EAGLE — workshop default)
 
 The handler-side launch script lives at `workshop/hotaisle/launch-qwen.sh`.
-For a one-off test:
+The config below is the validated workshop default — BF16 weights with
+Stage-1 (cuda graphs) + Stage-2 (EAGLE/MTP draft) + Stage-3 (deeper draft,
+chunked prefill, LPM scheduling) optimizations stacked. Single-stream
+decode runs ~190 tok/s vs the 35 tok/s vanilla baseline.
 
 ```bash
 docker run -d --name sglang \
     --device=/dev/kfd --device=/dev/dri --group-add video \
     --shm-size 32g --ipc host \
     -e SGLANG_USE_AITER=1 \
+    -e SGLANG_ENABLE_SPEC_V2=1 \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
     -e HF_TOKEN="$HF_TOKEN" \
     -p 30000:30000 \
     qwen-sglang:rocm720-aiter112-sgmain \
     python3 -m sglang.launch_server \
-        --model-path Qwen/Qwen3.6-27B-FP8 \
+        --model-path Qwen/Qwen3.6-27B \
+        --dtype bfloat16 \
         --tp 1 \
         --attention-backend triton \
         --linear-attn-backend triton \
-        --fp8-gemm-backend aiter \
-        --context-length 65536 \
-        --max-running-requests 16 \
+        --context-length 131072 \
+        --max-running-requests 8 \
         --max-total-tokens 1100000 \
         --mem-fraction-static 0.92 \
+        --cuda-graph-max-bs 8 \
+        --cuda-graph-bs 1 2 4 8 \
+        --triton-attention-num-kv-splits 16 \
+        --chunked-prefill-size 32768 \
+        --max-prefill-tokens 32768 \
+        --num-continuous-decode-steps 2 \
+        --schedule-policy lpm \
+        --enable-tokenizer-batch-encode \
+        --speculative-algorithm EAGLE \
+        --speculative-num-steps 5 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 6 \
         --reasoning-parser qwen3 \
         --tool-call-parser qwen3_coder \
         --api-key "$SGLANG_API_KEY" \
+        --admin-api-key "$SGLANG_ADMIN_API_KEY" \
         --enable-metrics --enable-cache-report \
-        --cuda-graph-max-bs 16 \
-        --cuda-graph-bs 1 2 4 8 16 \
-        --triton-attention-num-kv-splits 16 \
         --disable-piecewise-cuda-graph
 ```
+
+For an FP8 test (Qwen3.6-27B-FP8 — loads correctly with this image but
+runs ~half BF16's decode speed; see BENCHMARKS.md for why), swap
+`--model-path` and add `--fp8-gemm-backend aiter`. Drop `--dtype` (the
+checkpoint determines dtype). Don't try this for a workshop today — it's
+just there as proof the loader fix works.
 
 ## Mandatory flags for Qwen3.5 / Qwen3.6 GDN models on AMD
 
@@ -93,14 +113,17 @@ the new short SHA, push.
 
 ## Performance
 
-See [BENCHMARKS.md](./BENCHMARKS.md) for measured single-stream and
-16-concurrent numbers, FP8-vs-BF16 results, cuda-graph impact, and
+See [BENCHMARKS.md](./BENCHMARKS.md) for measured numbers across all
+optimization stages, FP8-vs-BF16 results, EAGLE acceptance metrics, and
 findings on what didn't work (INT4 AWQ, latest-rocm tag).
 
-**TL;DR:** BF16 is the right choice on this stack today. FP8 loads
-correctly with the rebuilt image but runs at ~half BF16's decode speed
-because attention stays Triton/BF16-bound and aiter's FP8 GEMM lacks
-tuned configs for Qwen3.6 shapes.
+**TL;DR:** Workshop default is BF16 + EAGLE + Stage-3 tuning →
+**~190 tok/s single-stream** (5.4× over the 35 tok/s vanilla baseline),
+~280-310 tok/s aggregate at 2 concurrent streams. FP8 loads correctly
+with this image but runs at ~half BF16's decode speed because attention
+stays Triton/BF16-bound (AITER GDN broken upstream) and aiter's FP8 GEMM
+lacks tuned configs for Qwen3.6 shapes — kept here only for the loader
+fix proof.
 
 ## Pushing manually (no CI)
 
